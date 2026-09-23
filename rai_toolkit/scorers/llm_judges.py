@@ -72,6 +72,26 @@ def _judge_display_name(call: Any) -> str:
         return "judge"
 
 
+def _sanitize_judge_value(value: Any) -> Any:
+    """Return a JSON-strict copy of a judge reply for the audit record.
+
+    Python's JSON parser accepts NaN/Infinity literals, so a raw reply can
+    carry non-finite floats that break strict serialization
+    (``json.dumps(..., allow_nan=False)``). Non-finite floats are replaced
+    recursively with their string form, so the audit record keeps the
+    information without breaking the contract.
+    """
+    if isinstance(value, float) and not math.isfinite(value):
+        if math.isnan(value):
+            return "NaN"
+        return "Infinity" if value > 0 else "-Infinity"
+    if isinstance(value, dict):
+        return {key: _sanitize_judge_value(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_sanitize_judge_value(item) for item in value]
+    return value
+
+
 class LLMJudgeScorer(BaseScorer):
     """Base class for LLM-as-a-Judge scorers.
 
@@ -159,6 +179,52 @@ class LLMJudgeScorer(BaseScorer):
             logger.error("Judge call failed: %s", e)
             return {"score": 0, "explanation": f"Judge error: {e}"}
 
+    def _non_finite_score_result(
+        self,
+        raw_score: float,
+        judge_response: Any,
+        extra_details: dict[str, Any] | None = None,
+    ) -> ScorerResult:
+        """Un-assessed result for a judge score of NaN or +/- infinity.
+
+        Normalization clamps with ``min``/``max``, and both silently swallow
+        NaN: ``min(1.0, nan)`` returns 1.0, so a NaN score would normalize to
+        a perfect 1.0 and a row the judge never really graded would read as
+        fully compliant. Infinities clamp to the ends of the scale for the
+        same reason. None of the three is a grade on the 0-3 compliance
+        scale, so the row is reported as un-assessed -- excluded from the
+        aggregate rather than diluting it -- instead.
+
+        ``raw_score`` and the judge payload are stored in their string form
+        (``"NaN"``, ``"Infinity"``, ``"-Infinity"``), so the audit record
+        keeps the evidence and still survives the report's strict
+        serialization (``json.dumps(..., allow_nan=False)``).
+        """
+        score_label = _sanitize_judge_value(raw_score)
+        details: dict[str, Any] = {
+            "skipped": "non_finite_judge_score",
+            "scorer_name": self.name,
+            "raw_score": score_label,
+            "max_score": 3,
+            "judge_model": self.model,
+            "judge_response": _sanitize_judge_value(judge_response),
+        }
+        if extra_details:
+            details.update(extra_details)
+        return ScorerResult(
+            score=0.0,
+            passed=False,
+            category=self.category,
+            explanation=(
+                "Un-assessed: the judge returned a non-finite score "
+                f"({score_label}), which is not a grade on the 0-3 compliance "
+                "scale. Inspect details.judge_response to see what the judge "
+                "returned."
+            ),
+            details=details,
+            assessed=False,
+        )
+
     def score(
         self,
         output: str,
@@ -181,6 +247,8 @@ class LLMJudgeScorer(BaseScorer):
         result = self._call_judge(prompts["system"], user_prompt)
 
         raw_score = float(result.get("score", 0))
+        if not math.isfinite(raw_score):
+            return self._non_finite_score_result(raw_score, result)
         normalized = ScoreNormalizer.from_compliance_scale(raw_score)
         passed = ScoreNormalizer.apply_threshold(normalized, self.threshold)
 
@@ -194,7 +262,11 @@ class LLMJudgeScorer(BaseScorer):
                 "raw_score": raw_score,
                 "max_score": 3,
                 "judge_model": self.model,
-                "judge_response": result,
+                # A finite ``score`` does not make the rest of the reply
+                # finite: a stray NaN in any other field would still break
+                # the report's strict serialization, so the whole payload is
+                # sanitized on the assessed path too.
+                "judge_response": _sanitize_judge_value(result),
             },
         )
 
@@ -390,6 +462,15 @@ class GroundednessScorer(LLMJudgeScorer):
         user_prompt = self._format_prompt(output=output, input=input, context=context)
         result = self._call_judge(prompts["system"], user_prompt)
         raw_score = float(result.get("score", 0))
+        if not math.isfinite(raw_score):
+            # Evidence spans stay empty: an un-assessed row claims no
+            # supporting or contradicting evidence, the same shape the other
+            # un-assessed branches above return.
+            return self._non_finite_score_result(
+                raw_score,
+                result,
+                extra_details={"supporting_spans": [], "contradicting_spans": []},
+            )
         normalized = ScoreNormalizer.from_compliance_scale(raw_score)
         raw_supporting = result.get("supporting_spans")
         raw_contradicting = result.get("contradicting_spans")
@@ -464,26 +545,6 @@ def _split_context_chunks(context: str) -> list[str]:
                 chunks.append(block)
         return chunks
     return [c for c in text.split("---") if c.strip()]
-
-
-def _sanitize_judge_value(value: Any) -> Any:
-    """Return a JSON-strict copy of a judge reply for the audit record.
-
-    Python's JSON parser accepts NaN/Infinity literals, so a raw reply can
-    carry non-finite floats that break strict serialization
-    (``json.dumps(..., allow_nan=False)``). Non-finite floats are replaced
-    recursively with their string form, so the audit record keeps the
-    information without breaking the contract.
-    """
-    if isinstance(value, float) and not math.isfinite(value):
-        if math.isnan(value):
-            return "NaN"
-        return "Infinity" if value > 0 else "-Infinity"
-    if isinstance(value, dict):
-        return {key: _sanitize_judge_value(item) for key, item in value.items()}
-    if isinstance(value, (list, tuple)):
-        return [_sanitize_judge_value(item) for item in value]
-    return value
 
 
 def _escape_chunk_content(chunk: str) -> str:

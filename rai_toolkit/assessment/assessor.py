@@ -1687,6 +1687,11 @@ def _classify_unassessed_reason(sr: ScorerResult) -> str:
         return "behavioral/refusal row"
     if "skipped" in details and details["skipped"] == "empty_context":
         return "no grounding context"
+    # A non-finite judge score is a scorer/judge integration problem, not a
+    # dataset gap: the reply parsed but carried NaN or an infinity where a
+    # 0-3 grade belongs, so it is binned with the parser failures.
+    if "skipped" in details and details["skipped"] == "non_finite_judge_score":
+        return "scorer integration / parser failure"
     if "refusal/boundary" in explanation or "refusal or boundary" in explanation:
         return "behavioral/refusal row"
     if "no grounding context" in explanation or "no context" in explanation:
