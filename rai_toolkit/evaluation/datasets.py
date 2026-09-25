@@ -82,12 +82,24 @@ class DatasetLoader:
     def _load_json(path: Path) -> list[dict[str, Any]]:
         with open(path, encoding="utf-8") as f:
             data = json.load(f)
+
         if isinstance(data, list):
-            rows = [DatasetLoader._normalize_keys(item) for item in data]
-        elif isinstance(data, dict) and "data" in data:
-            rows = [DatasetLoader._normalize_keys(item) for item in data["data"]]
+            items = data
+        elif isinstance(data, dict) and "data" in data and isinstance(data["data"], list):
+            items = data["data"]
         else:
-            raise ValueError("JSON must be a list of objects or {data: [...]}")
+            raise ValueError(
+                f"{path}: JSON dataset must be a list of objects or an object with a 'data' list"
+            )
+
+        rows = []
+        for index, item in enumerate(items, start=1):
+            if not isinstance(item, dict):
+                raise ValueError(
+                    f"{path}: row {index}: dataset row must be a JSON object"
+                )
+            rows.append(DatasetLoader._normalize_keys(item))
+
         logger.info("Loaded %d rows from %s", len(rows), path)
         return rows
 
